@@ -1,0 +1,989 @@
+import copy
+from ..calc.a import cal_A_global_2d,cal_A_global_3d
+from .contface import ContFace
+import math
+import sys
+import mosek
+from ..utils.parameter import get_dimension, get_max_step, get_max_iteration, get_beta, get_alpha, get_crack_tolerance, get_convergence_tolerance
+from .util import _update_elem_disp_2d, _update_contp_force_2d, _update_contp_crack_2d, _line1, _line2, _line3, _line4,_update_elem_disp_3d
+from .finitefc_associative import solve_finitefc_associative
+import numpy as np
+from tqdm import tqdm
+print_detail = False
+
+
+def solve_finitefc_nonassociative(elems, contps, current_alpha=0.3, beta=0.6, max_iteration=10, \
+                                  stop_tolerance=0.0001, _alpha_multiplier=0.5, Aglobal=None,BC='cantilever'):
+    """Solve limit force using non-associative flow rule
+
+    :param elems: Dictionary of elements. Key is the element id, value is Element.
+    :type elems: dict
+    :param contps: Dictionary of contact points. Key is the point id, value is ContPoint.
+    :type contps: dict
+    :return: Solution of the final step
+    :rtype: dict
+    """
+    if get_dimension() == 2:
+        solution = solve_finitefc_nonassociative_2d(
+            elems, contps, current_alpha, _alpha_multiplier, beta, max_iteration, stop_tolerance, Aglobal=Aglobal)
+        _update_contp_force_2d(contps, solution['contact_forces'])
+        if solution['limit_force'] > 0:
+            for p in solution['sliding_points']:
+                if contps[p].normal_force > 0:
+                    contps[p].sliding_failure = True
+            for p in solution['strength_failure_points']:
+                contps[p].strength_failure = True
+        return solution
+    elif get_dimension() == 3:
+        return solve_finitefc_nonassociative_3d(elems, contps,current_alpha, beta, max_iteration, \
+                                                stop_tolerance, Aglobal=Aglobal,BC=BC)
+
+
+def solve_finitefc_nonassociative_3d(elems, contps,alpha_min, beta, max_iteration, stop_tolerance, Aglobal=None,BC='cantilever'):
+    # initial solution with associative flow rule
+    non_asso_interations_lambdas = np.empty(max_iteration) * np.nan
+    solution = solve_finitefc_associative(elems, contps, Aglobal=Aglobal)
+    if solution['limit_force'] <= 0:
+        #_update_elem_disp_2d(contps, elems, solution["displacements"])
+        return solution
+    non_asso_interations_lambdas[0] = solution['limit_force']
+    print("Solution with associative flow rule:", solution['limit_force'])
+    # # get the normal force at each point
+    # _max_normal_force = 0
+    point_index = 0
+    for k, v in contps.items():
+        v.normal_force = solution['contact_forces'][point_index*4+2]
+        # if v.normal_force > _max_normal_force:
+        #     _max_normal_force = v.normal_force
+        point_index += 1
+    #for k, v in contps.items():
+        # The small cohesion value is required to avoid uncontrollable penetration potentially
+        # resulting when the normal force at a contact is zero
+        # https://www.sciencedirect.com/science/article/pii/S0045794906000356
+        #v.c0 = 0.00001 * _max_normal_force
+        # v.c0 = 0.00001 * _max_normal_force # the value is sometimes too large that artificially increase the cohesion of material
+        #v.c0 = 0.00001
+        #v.cont_type.cohesion = max(v.cont_type.cohesion, v.c0)
+    current_alpha = alpha_min
+    for iter in range(1, max_iteration):
+        print(f"--Iteration {iter}")
+        prev_solution = solution
+        solution = _solve_finitefc_nonassociative_3d_unit(
+            elems, contps, current_alpha, Aglobal=Aglobal,BC=BC)
+        if solution['limit_force'] <= 0:
+            _update_elem_disp_3d(contps, elems, prev_solution["displacements"])
+            return prev_solution
+        non_asso_interations_lambdas[iter] = solution['limit_force']
+        print(
+            f"--Current solution of limit force: {solution['limit_force']}")
+        # lambdas.append(solution['limit_force'])
+        # get the normal force at each point
+        point_index = 0
+        for k, v in contps.items():
+            # v.normal_force = solution['contact_forces'][point_index*2+1]
+            v.normal_force = beta*solution['contact_forces'][point_index*2+2]+(
+                1-beta)*prev_solution['contact_forces'][point_index*2+2]
+            # v.tangent_force = beta*solution['contact_forces'][point_index*2]+(
+            #     1-beta)*prev_solution['contact_forces'][point_index*2]
+            point_index += 1
+        # update alpha
+        current_alpha = alpha_min
+        # check stop criteria
+        if abs((non_asso_interations_lambdas[iter-1]-non_asso_interations_lambdas[iter])/non_asso_interations_lambdas[iter-1]) < stop_tolerance:
+            print("Convergence reached")
+            _update_elem_disp_3d(contps, elems, solution["displacements"])
+            return solution
+    _update_elem_disp_3d(contps, elems, solution["displacements"])
+    return solution
+
+
+def solve_finitefc_nonassociative_2d(elems, contps, current_alpha, _alpha_multiplier, beta, max_itreration, stop_tolerance, Aglobal=None):
+    # initial solution with associative flow rule
+    non_asso_interations_lambdas = np.empty(max_itreration) * np.nan
+    solution = solve_finitefc_associative(elems, contps, Aglobal=Aglobal)
+    if solution['limit_force'] <= 0:
+        #_update_elem_disp_2d(contps, elems, solution["displacements"])
+        return solution
+    non_asso_interations_lambdas[0] = solution['limit_force']
+    print("Solution with associative flow rule:", solution['limit_force'])
+    # get the normal force at each point
+    _max_normal_force = 0
+    point_index = 0
+    for k, v in contps.items():
+        v.normal_force = solution['contact_forces'][point_index*2+1]
+        if v.normal_force > _max_normal_force:
+            _max_normal_force = v.normal_force
+        point_index += 1
+    for k, v in contps.items():
+        # The small cohesion value is required to avoid uncontrollable penetration potentially
+        # resulting when the normal force at a contact is zero
+        # https://www.sciencedirect.com/science/article/pii/S0045794906000356
+        #v.c0 = 0.00001 * _max_normal_force
+        # v.c0 = 0.00001 * _max_normal_force # the value is sometimes too large that artificially increase the cohesion of material
+        v.c0 = 0.00001
+        v.cont_type.cohesion = max(v.cont_type.cohesion, v.c0)
+
+    for iter in range(1, max_itreration):
+        print(f"--Iteration {iter}")
+        prev_solution = solution
+        solution = _solve_finitefc_nonassociative_2d_unit(
+            elems, contps, current_alpha, Aglobal=Aglobal)
+        if solution['limit_force'] <= 0:
+            _update_elem_disp_2d(contps, elems, prev_solution["displacements"])
+            return prev_solution
+        non_asso_interations_lambdas[iter] = solution['limit_force']
+        print(
+            f"--Current solution of limit force: {solution['limit_force']}")
+        # lambdas.append(solution['limit_force'])
+        # get the normal force at each point
+        point_index = 0
+        for k, v in contps.items():
+            # v.normal_force = solution['contact_forces'][point_index*2+1]
+            v.normal_force = beta*solution['contact_forces'][point_index*2+1]+(
+                1-beta)*prev_solution['contact_forces'][point_index*2+1]
+            v.tangent_force = beta*solution['contact_forces'][point_index*2]+(
+                1-beta)*prev_solution['contact_forces'][point_index*2]
+            point_index += 1
+        # update alpha
+        current_alpha = max(current_alpha*_alpha_multiplier, 0.001)
+        # check stop criteria
+        if abs((non_asso_interations_lambdas[iter-1]-non_asso_interations_lambdas[iter])/non_asso_interations_lambdas[iter-1]) < stop_tolerance:
+            print("Convergence reached")
+            _update_elem_disp_2d(contps, elems, solution["displacements"])
+            return solution
+    _update_elem_disp_2d(contps, elems, solution["displacements"])
+    return solution
+
+
+def solve_residual_finitefc_nonassociative_2d(elems, contps, _alpha=0.3, _alpha_multiplier=0.5, _beta=0.6, _max_steps=3, _max_itreration=10, _tolerance=0.0001):
+    """Iterative process to solve 2D limit force with non associative flow rule and crack mechanism
+
+    :param elems: Dictionary of elements. Key is the element id, value is Element.
+    :type elems: dict
+    :param contps: Dictionary of contact points. Key is the point id, value is ContPoint.
+    :type contps: dict
+    :return: Solution of the final step
+    :rtype: dict
+    """
+    lambdas = np.zeros((_max_itreration, _max_steps))
+
+    # store parameters
+    for k, value in contps.items():
+        value.stored_ft = value.cont_type.ft
+        value.stored_cohesion = value.cont_type.cohesion
+
+    # assemble contact faces
+    contfs = dict()
+    for p in contps.values():
+        if p.faceID not in contfs.keys():
+            face = ContFace(p.faceID, p.section_h,
+                            p.cont_type.fc, p.cont_type.ft)
+            contfs[face.id] = face
+            contfs[p.faceID].contps.append(p.id)
+            contfs[p.faceID].contps.append(p.counterPoint)
+        else:
+            contfs[p.faceID].contps.append(p.id)
+            contfs[p.faceID].contps.append(p.counterPoint)
+    for step in range(_max_steps):
+        print(f"Step {step}")
+        # initial solution with associative flow rule
+        current_alpha = _alpha
+
+        if step == 0:
+            solution = solve_finitefc_associative(elems, contps)
+            if solution['limit_force'] <= 0:
+                _update_elem_disp_2d(contps, elems, solution['displacements'])
+                return solution
+        if step > 0:
+            prev_solution = solution
+            solution = solve_finitefc_associative(elems, contps)
+            if solution['limit_force'] <= 0:
+                _update_elem_disp_2d(
+                    contps, elems, prev_solution['displacements'])
+                return prev_solution
+        lambdas[0, step] = solution['limit_force']
+        print("Solution with associative flow rule:", solution['limit_force'])
+        # get the normal force at each point
+        _max_normal_force = 0
+        point_index = 0
+        for k, v in contps.items():
+            v.normal_force = solution['contact_forces'][point_index*2+1]
+            v.tangent_force = solution['contact_forces'][point_index*2]
+            if v.normal_force > _max_normal_force:
+                _max_normal_force = v.normal_force
+            point_index += 1
+        for k, v in contps.items():
+            # The small cohesion value is required to avoid uncontrollable penetration potentially
+            # resulting when the normal force at a contact is zero
+            # https://www.sciencedirect.com/science/article/pii/S0045794906000356
+            #v.c0 = 0.00001 * _max_normal_force
+            v.c0 = 0.00001 * _max_normal_force
+            v.cont_type.cohesion = max(v.cont_type.cohesion, v.c0)
+
+        for iter in range(1, _max_itreration):
+            print(f"--Iteration {iter}")
+            prev_solution = solution
+            solution = _solve_finitefc_nonassociative_2d_unit(
+                elems, contps, current_alpha)
+            if solution['limit_force'] <= 0:
+                solution = prev_solution
+                lambdas[iter:, step] = lambdas[iter, step]
+                break
+            lambdas[iter, step] = solution['limit_force']
+            print(
+                f"--Current solution of limit force: {solution['limit_force']}")
+            # lambdas.append(solution['limit_force'])
+            # get the normal force at each point
+            point_index = 0
+            for k, v in contps.items():
+                # v.normal_force = solution['contact_forces'][point_index*2+1]
+                v.normal_force = _beta*solution['contact_forces'][point_index*2+1]+(
+                    1-_beta)*prev_solution['contact_forces'][point_index*2+1]
+                v.tangent_force = _beta*solution['contact_forces'][point_index*2]+(
+                    1-_beta)*prev_solution['contact_forces'][point_index*2]
+                point_index += 1
+            # update alpha
+            current_alpha = max(current_alpha*_alpha_multiplier, 0.001)
+            # check stop criteria
+            if abs((lambdas[iter-1, step]-lambdas[iter, step])/lambdas[iter-1, step]) < _tolerance:
+                # fill in the rest of the lambdas
+                lambdas[iter:, step] = lambdas[iter, step]
+                break
+        # print(solution['displacements'])
+        #_update_elem_disp_2d(contps, elems, solution['displacements'])
+        # for element in elems.values():
+        #     print(element.displacement)
+        if step >= 1 and abs((lambdas[iter-1, step-1]-lambdas[iter-1, step])/lambdas[iter-1, step-1]) < _tolerance:
+            break
+        # update cracked interface
+        _update_contp_crack_2d(contps, elems, contfs,
+                               solution['sliding_points'])
+
+        _update_contp_force_2d(contps, solution['contact_forces'])
+
+    _update_elem_disp_2d(contps, elems, solution['displacements'])
+    return solution
+
+
+def _solve_finitefc_nonassociative_2d_unit(elems, contps, alpha_iter, Aglobal=None):
+    """Solve optimization of one iteration in the non-associative solver
+
+    :param elems: Dictionary of elements
+    :type elems: dict
+    :param contps: Dictionary of contact points
+    :type contps: dict
+    :param alpha_iter: Alpha of current iteration
+    :type alpha_iter: float
+    :raises NameError: Undefined contact type, available types are: 'friction', 'friction_fc', 'friction_fc_cohesion'
+    :raises NameError: One contact face(segment in 2d) on candidate element should contain only two contact points
+    :raises NameError: One contact face(segment in 2d) on antagonist element should contain only two contact points
+    :return: Solution
+    :rtype: dict
+    """
+    if Aglobal is None:
+        Aglobal = cal_A_global_2d(elems, contps)
+    # result container
+    result = dict()
+    # assemble contact faces
+    contfs = dict()
+    for p in contps.values():
+        if p.faceID not in contfs.keys():
+            face = ContFace(p.faceID, p.section_h,
+                            p.cont_type.fc, p.cont_type.ft)
+            contfs[face.id] = face
+            contfs[p.faceID].contps.append(p.id)
+            # contfs[p.faceID].contps.append(p.counterPoint)
+        else:
+            contfs[p.faceID].contps.append(p.id)
+            # contfs[p.faceID].contps.append(p.counterPoint)
+
+    nb_contfs = len(contfs)
+    inf = 0.0
+
+    def streamprinter(text):
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
+    limit_force = 0
+    # Make mosek environment
+    with mosek.Env() as env:
+        # Create a task object
+        with env.Task(0, 0) as task:
+            # Attach a log stream printer to the task
+            if print_detail:
+                task.set_Stream(mosek.streamtype.log, streamprinter)
+
+            # Bound keys and values for constraints -- force equilibrium
+            bkc = []
+            blc = []
+            buc = []
+            for key, value in elems.items():
+                if value.type == "ground":
+                    bkc.extend([mosek.boundkey.fr,
+                                mosek.boundkey.fr,
+                                mosek.boundkey.fr])
+                    blc.extend([-inf, -inf, -inf])
+                    buc.extend([inf, inf, inf])
+                else:
+                    bkc.extend([mosek.boundkey.fx,
+                                mosek.boundkey.fx,
+                                mosek.boundkey.fx])
+                    blc.extend([value.dl[0], value.dl[1], value.dl[2]])
+                    buc.extend([value.dl[0], value.dl[1], value.dl[2]])
+
+            # Bound keys and values for constraints -- contact failure condition
+
+            for key, value in contps.items():
+                if value.cont_type.type == 'friction' or value.cont_type.type == 'friction_fc':
+                    bkc.extend(
+                        [mosek.boundkey.up, mosek.boundkey.up, mosek.boundkey.up])
+                    blc.extend([-inf, -inf, -inf])
+                    buc.extend([value.c0+(1+alpha_iter)*value.cont_type.mu*value.normal_force,
+                                value.c0+(1+alpha_iter)*value.cont_type.mu*value.normal_force, 0.0])
+
+                elif value.cont_type.type == 'friction_fc_cohesion':
+                    bkc.extend(
+                        [mosek.boundkey.up, mosek.boundkey.up, mosek.boundkey.fr])
+                    blc.extend([-inf, -inf, -inf])
+                    buc.extend(
+                        [value.cont_type.cohesion+(1+alpha_iter)*value.cont_type.mu*value.normal_force,
+                         value.cont_type.cohesion+(1+alpha_iter)*value.cont_type.mu*value.normal_force, +inf])  # no cut off
+
+                else:
+                    raise NameError("unknown contact type!")
+            # Bound keys and values for constraints -- crushing failure condition
+
+            for key, value in contfs.items():
+                bkc.extend([mosek.boundkey.up, mosek.boundkey.up,
+                            mosek.boundkey.up, mosek.boundkey.up,
+                            mosek.boundkey.up, mosek.boundkey.up,
+                            mosek.boundkey.up, mosek.boundkey.up])
+                blc.extend([-inf, -inf, -inf, -inf, inf, -inf, -inf, -inf])
+                # buc.extend([0.0, 0.0, (1/16)*value.fc*(value.height**2), (1/16)*value.fc*(value.height**2),
+                #             (3/16)*value.fc*(value.height**2), (3/16) *
+                #             value.fc*(value.height**2),
+                #             (3/8)*value.fc*(value.height**2), (3/8)*value.fc*(value.height**2)])
+                buc.extend([-_line1(value.fc, value.ft, value.height)[1], -_line1(value.fc, value.ft, value.height)[1], -_line2(value.fc, value.ft, value.height)[1], -_line2(value.fc, value.ft, value.height)[1],
+                            -_line3(value.fc, value.ft, value.height)[1], -_line3(
+                                value.fc, value.ft, value.height)[1],
+                            -_line4(value.fc, value.ft, value.height)[1], -_line4(value.fc, value.ft, value.height)[1]])
+
+            # Bound keys for variables
+            bkx = []
+            blx = []
+            bux = []
+            g_index = 0
+            for key, value in contps.items():
+                for i in range(2):
+                    bkx.append(mosek.boundkey.fr)
+                    blx.append(-inf)
+                    bux.append(+inf)
+
+                    g_index += 1
+            bkx.append(mosek.boundkey.lo)
+            blx.append(0)
+            bux.append(+inf)
+
+            # # Objective coefficients
+            # c = []
+            # g_index = 0
+            # for key, value in contps.items():
+            #     for i in range(2):  # 2variables(t,n)*1nodes*2contact faces
+            #         c.append(-0)
+            #         # print(-g[g_index])
+            #         g_index += 1
+            # c.append(1.0)
+
+            # Objective coefficients
+            c = []
+            for key, value in contps.items():
+                # for i in range(2):  # 2variables(t,n)*1nodes*2contact faces
+                c.extend([-value.gap[0], -value.gap[1]])
+                # print(-g[g_index])
+            c.append(1.0)
+
+            # Below is the sparse representation of the A
+            # matrix stored by column.
+            asub = []
+            aval = []
+            faceIDs = list(contfs.keys())
+            for i, value in enumerate(contps.values()):
+                for j in range(2):  # 2variables(t,n)*1nodes*
+                    col = i*2+j
+                    col_index = []
+                    col_value = []
+                    if type(Aglobal) is tuple:  # sparse matrix
+                        col_index.extend(Aglobal[0][col])
+                        col_value.extend(Aglobal[1][col])
+                    else:
+                        for row in range(len(elems)*3):
+                            if Aglobal[row][col] != 0:
+                                col_index.append(row)
+                                col_value.append(Aglobal[row][col])
+                    _start_row = len(elems)*3 + math.floor(col/2)*3
+                    col_index.extend(
+                        list(range(_start_row, _start_row+3)))
+                    if col % 2 == 0:
+                        col_value.extend([1, -1, 0])  # coefficient of t
+                    else:
+                        col_value.extend(
+                            [+alpha_iter*value.cont_type.mu, +alpha_iter*value.cont_type.mu, -1])  # coefficients of n
+
+                    # crushing failure
+                    if col % 2 == 1:
+                        _start_row_crushing = len(elems)*3+len(contps)*3
+                        for face_index in range(len(faceIDs)):
+                            if value.faceID == faceIDs[face_index]:
+                                # determin current point is point1 or point2
+                                # ? should points on the antagonist face be considered?
+                                # print(value.faceID)
+                                # print(contfs[value.faceID].contps)
+                                # print(value)
+                                point_rank = contfs[value.faceID].contps.index(
+                                    value.id)
+                                if point_rank == 0 or point_rank == 3:
+                                    _coeff = 1
+                                elif point_rank == 1 or point_rank == 2:
+                                    _coeff = -1
+                                else:  # error message that more that two points are found for one face
+                                    raise NameError(
+                                        "more than two points are found for one face")
+                                col_index.extend(
+                                    list(range(_start_row_crushing+face_index*8, _start_row_crushing+face_index*8+8)))
+                                # col_value.extend([-1/4*value.section_h+_coeff*value.lever,
+                                #                   -1/4*value.section_h-_coeff*value.lever,
+                                #                   1/4*value.section_h+_coeff*value.lever,
+                                #                   1/4*value.section_h-_coeff*value.lever])
+                                # col_value.extend([-3/8*value.section_h+_coeff*value.lever,
+                                #                   -3/8*value.section_h-_coeff*value.lever,
+                                #                   1/4*value.section_h+_coeff*value.lever,
+                                #                   1/4*value.section_h-_coeff*value.lever])
+                                # col_value.extend([-3/8*value.section_h+_coeff*value.lever,
+                                #                   -3/8*value.section_h-_coeff*value.lever,
+                                #                   -1/8*value.section_h+_coeff*value.lever,
+                                #                   -1/8*value.section_h-_coeff*value.lever,
+                                #                   1/8*value.section_h+_coeff*value.lever,
+                                #                   1/8*value.section_h-_coeff*value.lever,
+                                #                   3/8*value.section_h+_coeff*value.lever,
+                                #                   3/8*value.section_h-_coeff*value.lever])
+
+                                col_value.extend([_line1(value.cont_type.fc, value.cont_type.ft, value.section_h)[0]+_coeff*value.lever,
+                                                  _line1(value.cont_type.fc, value.cont_type.ft, value.section_h)[
+                                    0]-_coeff*value.lever,
+                                    _line2(value.cont_type.fc, value.cont_type.ft, value.section_h)[
+                                    0]+_coeff*value.lever,
+                                    _line2(value.cont_type.fc, value.cont_type.ft, value.section_h)[
+                                    0]-_coeff*value.lever,
+                                    _line3(value.cont_type.fc, value.cont_type.ft, value.section_h)[
+                                    0]+_coeff*value.lever,
+                                    _line3(value.cont_type.fc, value.cont_type.ft, value.section_h)[
+                                    0]-_coeff*value.lever,
+                                    _line4(value.cont_type.fc, value.cont_type.ft, value.section_h)[
+                                    0]+_coeff*value.lever,
+                                    _line4(value.cont_type.fc, value.cont_type.ft, value.section_h)[0]-_coeff*value.lever])
+                            elif value.counterPoint != -1 and contps[value.counterPoint].faceID == faceIDs[face_index]:
+                                # determin current point is point1 or point2
+                                # ? should points on the antagonist face be considered?
+                                # print(value.faceID)
+                                # print(contfs[value.faceID].contps)
+                                # print(value)
+                                point_rank = contfs[contps[value.counterPoint].faceID].contps.index(
+                                    contps[value.counterPoint].id)
+                                if point_rank == 0 or point_rank == 3:
+                                    _coeff = 1
+                                elif point_rank == 1 or point_rank == 2:
+                                    _coeff = -1
+                                else:  # error message that more that two points are found for one face
+                                    raise NameError(
+                                        "more than two points are found for one face")
+                                col_index.extend(
+                                    list(range(_start_row_crushing+face_index*8, _start_row_crushing+face_index*8+8)))
+                                # col_value.extend([-1*(1/4*value.section_h)+_coeff*value.lever,
+                                #                   -1*(1/4*value.section_h) -
+                                #                   _coeff*value.lever,
+                                #                   -1*(-1/4*value.section_h) +
+                                #                   _coeff*value.lever,
+                                #                   -1*(-1/4*value.section_h)-_coeff*value.lever])
+                                # col_value.extend([-3/8*value.section_h+_coeff*value.lever,
+                                #                   -3/8*value.section_h-_coeff*value.lever,
+                                #                   -1/8*value.section_h+_coeff*value.lever,
+                                #                   -1/8*value.section_h-_coeff*value.lever,
+                                #                   1/8*value.section_h+_coeff*value.lever,
+                                #                   1/8*value.section_h-_coeff*value.lever,
+                                #                   3/8*value.section_h+_coeff*value.lever,
+                                #                   3/8*value.section_h-_coeff*value.lever])
+
+                                col_value.extend([_line1(value.cont_type.fc, value.cont_type.ft, value.section_h)[0]+_coeff*value.lever,
+                                                  _line1(value.cont_type.fc, value.cont_type.ft, value.section_h)[
+                                    0]-_coeff*value.lever,
+                                    _line2(value.cont_type.fc, value.cont_type.ft, value.section_h)[
+                                    0]+_coeff*value.lever,
+                                    _line2(value.cont_type.fc, value.cont_type.ft, value.section_h)[
+                                    0]-_coeff*value.lever,
+                                    _line3(value.cont_type.fc, value.cont_type.ft, value.section_h)[
+                                    0]+_coeff*value.lever,
+                                    _line3(value.cont_type.fc, value.cont_type.ft, value.section_h)[
+                                    0]-_coeff*value.lever,
+                                    _line4(value.cont_type.fc, value.cont_type.ft, value.section_h)[
+                                    0]+_coeff*value.lever,
+                                    _line4(value.cont_type.fc, value.cont_type.ft, value.section_h)[0]-_coeff*value.lever])
+                    asub.append(col_index)
+                    aval.append(col_value)
+
+            col_index = []
+            col_value = []
+            i = 0
+            for key, value in elems.items():
+                col_index.extend([3*i, 3*i+1, 3*i+2])
+                col_value.extend(
+                    [-value.ll[0], -value.ll[1], -value.ll[2]])
+                i += 1
+            asub.append(col_index)
+            aval.append(col_value)
+
+            numvar = len(bkx)
+            numcon = len(bkc)
+
+            # Append 'numcon' empty constraints.
+            # The constraints will initially have no bounds.
+            task.appendcons(numcon)
+
+            # Append 'numvar' variables.
+            # The variables will initially be fixed at zero (x=0).
+            task.appendvars(numvar)
+
+            for j in range(numvar):
+                # Set the linear term c_j in the objective.
+
+                task.putcj(j, c[j])
+
+                # Set the bounds on variable j
+                # blx[j] <= x_j <= bux[j]
+                task.putvarbound(j, bkx[j], blx[j], bux[j])
+
+                # Input column j of A
+                task.putacol(j,                  # Variable (column) index.
+                             # Row index of non-zeros in column j.
+                             asub[j],
+                             aval[j])            # Non-zero Values of column j.
+
+            # Set the bounds on constraints.
+             # blc[i] <= constraint_i <= buc[i]
+
+            for i in range(numcon):
+                task.putconbound(i, bkc[i], blc[i], buc[i])
+
+            # Input the objective sense (minimize/maximize)
+            task.putobjsense(mosek.objsense.maximize)
+
+            # Solve the problem
+            # task.putintparam(mosek.iparam.optimizer,
+            #                  mosek.optimizertype.intpnt)
+            # task.putintparam(mosek.iparam.optimizer,
+            #                 mosek.optimizertype.dual_simplex)
+            # task.putintparam(mosek.iparam.intpnt_max_iterations, 1000)
+            # task.putintparam(mosek.iparam.intpnt_starting_point,
+            #                  mosek.startpointtype.constant)
+            # task.putintparam(mosek.iparam.intpnt_solve_form,
+            #                  mosek.solveform.dual)
+            # task.putintparam(mosek.iparam.bi_clean_optimizer,
+            #                  mosek.optimizertype.dual_simplex)
+            # task.putintparam(mosek.iparam.num_threads, 4)
+            # task.putintparam(mosek.iparam.presolve_eliminator_max_num_tries,
+            #                  0)
+            # task.putintparam(mosek.iparam.presolve_use,
+            #                 mosek.presolvemode.off)
+            task.writedata("data.opf")
+            task.optimize()
+            if print_detail:
+                # Print a summary containing information
+                # about the solution for debugging purposes
+                task.solutionsummary(mosek.streamtype.log)
+
+            # Get status information about the solution
+            solsta = task.getsolsta(mosek.soltype.bas)
+            solsta_itr = task.getsolsta(mosek.soltype.itr)
+
+            xx = [0.] * numvar
+            xc = [0.]*numcon
+
+            y = [0.]*numcon
+            if (solsta == mosek.solsta.optimal):
+
+                task.getxx(mosek.soltype.bas,  # Request the basic solution.
+                           xx)
+                task.getxc(mosek.soltype.bas, xc)
+                task.gety(mosek.soltype.bas, y)
+                # if print_detail:
+                #     print("Optimal solution: ")
+                #     for i in range(numvar):
+                #         print("x[" + str(i) + "]=" + str(xx[i]))
+                #     print("y")
+                #     for i in range(numcon):
+                #         print("y[" + str(i) + "]=" + str(y[i]))
+
+                limit_force = xx[-1]
+
+                states = [0]*numcon
+                task.getskc(mosek.soltype.bas, states)
+                limit_conditions = []
+                for s_i, s_j in enumerate(states):
+                    if s_j == mosek.stakey.upr:
+                        limit_conditions.append(s_i)
+                counter_start = len(elems)*3
+                sliding_points = []
+                strength_failure_points = []
+                for key, value in contps.items():
+                    for j in range(2):  # three constraints per point
+                        if counter_start in limit_conditions:
+                            sliding_points.append(key)
+                        counter_start += 1
+                    for j in range(1):
+                        if counter_start in limit_conditions:
+                            strength_failure_points.append(key)
+                        counter_start += 1
+                strength_failure_faces = []
+                for key, value in contfs.items():
+                    for j in range(8):  # eight constraints per face
+                        if counter_start in limit_conditions:
+                            strength_failure_faces.append(key)
+
+                        counter_start += 1
+                for face_key in strength_failure_faces:
+                    strength_failure_points.extend(contfs[face_key].contps)
+                result['sliding_points'] = list(set(sliding_points))
+                result['strength_failure_points'] = list(
+                    set(strength_failure_points))
+            elif(solsta_itr == mosek.solsta.optimal):
+                task.getxx(mosek.soltype.itr,  # Request the interior-point solution.
+                           xx)
+                task.getxc(mosek.soltype.itr, xc)
+                task.gety(mosek.soltype.itr, y)
+                task.getsuc(mosek.soltype.itr, suc)
+                limit_force = xx[-1]
+
+                states = [0]*numcon
+                task.getskc(mosek.soltype.itr, states)
+                limit_conditions = []
+                for s_i, s_j in enumerate(states):
+                    if s_j == mosek.stakey.upr:
+                        limit_conditions.append(s_i)
+                counter_start = len(elems)*3
+                sliding_points = []
+                strength_failure_points = []
+                for key, value in tqdm.tqdm(contps.items(), desc='check limit conditions on points'):
+                    for j in range(2):  # three constraints per point
+                        if counter_start in limit_conditions:
+                            sliding_points.append(key)
+                        counter_start += 1
+                    for j in range(1):
+                        if counter_start in limit_conditions:
+                            strength_failure_points.append(key)
+                        counter_start += 1
+                strength_failure_faces = []
+                for key, value in tqdm.tqdm(contfs.items(), desc='check limit conditions on faces'):
+                    for j in range(8):  # eight constraints per face
+                        if counter_start in limit_conditions:
+                            strength_failure_faces.append(key)
+
+                        counter_start += 1
+                for face_key in strength_failure_faces:
+                    strength_failure_points.extend(contfs[face_key].contps)
+                result['sliding_points'] = list(set(sliding_points))
+                result['strength_failure_points'] = list(
+                    set(strength_failure_points))
+            else:
+                if print_detail:
+                    print("Other solution status")
+                # return 0,[0.] * numvar
+                limit_force = 0
+        result["limit_force"] = limit_force
+        result["contact_forces"] = xx[0:numvar-1]
+        # dual optimization solutions
+
+        # task.getsolutionslice(
+        #     mosek.soltype.bas, mosek.solbasm.y, 0, len(elems)*3, y)
+
+        result["xc"] = xc
+
+        # # normalize the displacement by energy=1
+        # sum = 0
+        # element_index = 0
+        # for k, value in elems.items():
+        #     sum += value.ll[0]*y[element_index*3]+value.ll[1] * \
+        #         y[element_index*3+1]+value.ll[2]*y[element_index*3+2]
+        #     element_index += 1
+        # if sum == 0:
+        #     result["displacements"] = y[0:len(elems)*3]
+        # else:
+        #     result["displacements"] = (
+        #         np.array(y[0:len(elems)*3])/sum).tolist()
+        # normalize displacement by the maximal displacement
+        sum = 0
+        element_index = 0
+        for k, value in elems.items():
+            sum += value.ll[0]*y[element_index*3]+value.ll[1] * \
+                y[element_index*3+1]+value.ll[2]*y[element_index*3+2]
+            element_index += 1
+
+        max_disp = 0
+        for i in range(0, len(elems)):
+            max_disp = max(max_disp, abs(y[i*3]), abs(y[i*3+1]))
+        if max_disp == 0 or result["limit_force"] <= 0:
+            result["displacements"] = np.zeros(len(elems)*3).tolist()
+        else:
+            result["displacements"] = (
+                np.array(y[0:len(elems)*3])/max_disp*np.sign(sum)).tolist()
+
+    return result
+
+
+def _solve_finitefc_nonassociative_3d_unit(elems, contps,alpha_iter,Aglobal=None,BC='cantilever'):
+    """Solve the model with inifite fc, frictional contact with cohesion and associative flow rule
+
+    :param elems: Dictionary of elements
+    :type elems: dict
+    :param contps: Dictionary of contact points
+    :type contps: dict
+    :return: Solution. Available keys are 'displacements', 'limit_force', and 'contact_forces'
+    :rtype: dict
+    """
+    result = dict()
+    if Aglobal is None:
+        Aglobal = cal_A_global_3d(elems, contps)
+
+    inf = 0.0
+
+    def streamprinter(text):
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
+    with mosek.Env() as env:
+        # Create a task object
+        with env.Task(0, 0) as task:
+            # Attach a log stream printer to the task
+            if print_detail:
+                task.set_Stream(mosek.streamtype.log, streamprinter)
+
+            # Bound keys and values for constraints
+            bkc = []
+            blc = []
+            buc = []
+            for element in elems.values():
+                if element.type == "ground":
+                    bkc.extend([mosek.boundkey.fr,
+                                mosek.boundkey.fr,
+                                mosek.boundkey.fr,
+                                mosek.boundkey.fr,
+                                mosek.boundkey.fr,
+                                mosek.boundkey.fr])
+                    blc.extend([-inf, -inf, -inf, -inf, -inf, -inf])
+                    buc.extend([inf, inf, inf, inf, inf, inf])
+                elif element.type == "beam" and BC=='db':
+                    bkc.extend([mosek.boundkey.fx,
+                            mosek.boundkey.fx,
+                            mosek.boundkey.fx,
+                            mosek.boundkey.fr,
+                            mosek.boundkey.fr,
+                            mosek.boundkey.fr])
+                    blc.extend([element.dl[0],
+                                element.dl[1], element.dl[2], -inf, -inf, -inf])
+                    buc.extend([element.dl[0],
+                                element.dl[1], element.dl[2], inf, inf, inf])
+                else:
+                    bkc.extend([mosek.boundkey.fx,
+                                mosek.boundkey.fx,
+                                mosek.boundkey.fx,
+                                mosek.boundkey.fx,
+                                mosek.boundkey.fx,
+                                mosek.boundkey.fx])
+                    blc.extend([element.dl[0],
+                                element.dl[1], element.dl[2], element.dl[3],
+                                element.dl[4], element.dl[5]])
+                    buc.extend([element.dl[0],
+                                element.dl[1], element.dl[2], element.dl[3],
+                                element.dl[4], element.dl[5]])
+            for point in contps.values():  # 4th variable
+                # if elems[point.anta].type.startswith('stone') or elems[point.cand].type.startswith('stone'):
+                #     factor = 0.5
+                # else:
+                #     factor = 1
+                if (elems[point.anta].type.startswith('stone') and elems[point.cand].type.startswith('mortar'))\
+                    or (elems[point.anta].type.startswith('mortar') and elems[point.cand].type.startswith('stone')):
+                    factor = 1*point.section_h
+                elif elems[point.anta].type.startswith('mortar') and elems[point.cand].type.startswith('mortar'):
+                    factor = 1*point.section_h
+                elif elems[point.anta].type.startswith('stone') and elems[point.cand].type.startswith('stone'):
+                    factor = 1*point.section_h
+                else:
+                    factor = 1*point.section_h
+                bkc.extend([mosek.boundkey.fx])
+                blc.extend([-(point.cont_type.cohesion*factor+(1+alpha_iter)*point.cont_type.mu*point.normal_force)])
+                buc.extend([-(point.cont_type.cohesion*factor+(1+alpha_iter)*point.cont_type.mu*point.normal_force)])
+
+            # Bound keys for variables
+            bkx = []
+            blx = []
+            bux = []
+            for key, value in contps.items():
+                bkx.extend([mosek.boundkey.fr, mosek.boundkey.fr,
+                           mosek.boundkey.ra, mosek.boundkey.lo])
+                # if elems[value.anta].type.startswith('stone') or elems[value.cand].type.startswith('stone'):
+                #     factor = 0.5
+                # else:
+                #     factor = 1
+                factor_fc = 1*value.section_h
+                # if (elems[value.anta].type.startswith('stone') and elems[value.cand].type.startswith('mortar'))\
+                #     or (elems[value.anta].type.startswith('mortar') and elems[value.cand].type.startswith('stone')):
+                #     factor = 1*point.section_h
+                #     factor_fc = 1*point.section_h
+                # elif elems[value.anta].type.startswith('mortar') and elems[value.cand].type.startswith('mortar'):
+                #     factor = 1*point.section_h
+                #     factor_fc = 1*point.section_h
+                # elif elems[value.anta].type.startswith('stone') and elems[value.cand].type.startswith('stone'):
+                #     factor = 1*point.section_h
+                # else:
+                #     factor = 1*point.section_h
+                ft = -value.cont_type.ft*factor_fc
+                fc = value.cont_type.fc*factor_fc
+                blx.extend([-inf, -inf, ft, 0])
+                bux.extend([+inf, +inf, fc, +inf])
+                # for i in range(4):
+                #     bkx.append(mosek.boundkey.fr)
+                #     blx.append(-inf)
+                #     bux.append(+inf)
+
+            bkx.append(mosek.boundkey.lo)
+            blx.append(0)
+            bux.append(+inf)
+
+            # Objective coefficients
+            c = []
+            for key, value in contps.items():
+                # for i in range(2):  # 2variables(t,n)*1nodes*2contact faces
+                c.extend([-value.gap[0], -value.gap[1], -value.gap[2], 0])
+                # print(-g[g_index])
+            c.append(1.0)
+
+            # Below is the sparse representation of the A
+            # matrix stored by column.
+            asub = []
+            aval = []
+            for i, point in tqdm(enumerate(contps.values()), desc='assemble A matrix in mosek',total=len(contps)):
+                for j in range(3):
+                    col = i*4+j
+                    col_A = i*3+j
+                    col_index = []
+                    col_value = []
+                    if type(Aglobal) is tuple:  # sparse matrix
+                        col_index.extend(Aglobal[0][col_A])
+                        col_value.extend(Aglobal[1][col_A])
+                    else:
+                        for element_id in range(len(elems)):
+                            for equ in range(6):
+                                row_A = element_id*6+equ
+                                row = element_id*6+equ
+                                if Aglobal[row_A][col_A] != 0:
+                                    col_index.append(row)
+                                    col_value.append(Aglobal[row_A][col_A])
+                    if j == 2:  # add extra 4th variable for each contact point
+                        # if point.cont_type.mu > 0:
+                        # col_index.append(len(elems)*6+i)
+                        # col_value.append(point.cont_type.mu)
+                        # asub.extend([col_index, [len(elems)*6+i]])
+                        # aval.extend([col_value, [-1]])
+
+                        col_index.append(len(elems)*6+i)
+                        col_value.append(alpha_iter*point.cont_type.mu)
+                        asub.extend([col_index, [len(elems)*6+i]])
+                        aval.extend([col_value, [-1]])
+                    else:
+                        asub.append(col_index)
+                        aval.append(col_value)
+
+            col_index = []
+            col_value = []
+            i = 0
+            for element in elems.values():
+                col_index.extend([6*i, 6*i+1, 6*i+2, 6*i+3, 6*i+4, 6*i+5])
+                col_value.extend(
+                    [-element.ll[0], -element.ll[1], -element.ll[2], -element.ll[3], -element.ll[4], -element.ll[5]])
+                i += 1
+            asub.append(col_index)
+            aval.append(col_value)
+
+            # define the optimization task
+            numvar = len(bkx)
+            numcon = len(bkc)
+            task.appendcons(numcon)
+            task.appendvars(numvar)
+            for j in range(numvar):
+                task.putcj(j, c[j])
+                task.putvarbound(j, bkx[j], blx[j], bux[j])
+                task.putacol(j, asub[j], aval[j])
+            for i in range(numcon):
+                task.putconbound(i, bkc[i], blc[i], buc[i])
+            for i in range(len(contps)):
+                task.appendcone(mosek.conetype.quad,
+                                0.0,
+                                [4*i+3, 4*i+0, 4*i+1])
+            task.putobjsense(mosek.objsense.maximize)
+
+            # Solve the problem
+            #task.writedata("data.opf")
+            #task.putdouparam(dparam.intpnt_co_tol_dfeas, 1.0e-8)
+
+            #from mosek import dparam
+            #task.putdouparam(dparam.intpnt_co_tol_mu_red, 0)
+            task.optimize()
+
+            if print_detail:
+                task.solutionsummary(mosek.streamtype.msg)
+
+            # Get status information about the solution
+            #prosta = task.getprosta(mosek.soltype.itr)
+            solsta = task.getsolsta(mosek.soltype.itr)
+
+            xx = [0.] * numvar
+            xc = [0.]*numcon
+            y = [0.]*numcon
+            suc = [0.]*numcon
+
+            # !!!!!!!!!!!!!!!!unknow also yield to correct result -> from experience
+            # if (solsta == mosek.solsta.optimal or solsta == mosek.solsta.unknown):
+            if (solsta == mosek.solsta.optimal or solsta == mosek.solsta.unknown):
+                task.getxx(mosek.soltype.itr, xx)
+                task.getxc(mosek.soltype.itr, xc)
+                task.gety(mosek.soltype.itr, y)
+                task.getsuc(mosek.soltype.itr, suc)
+                # if print_detail:
+                #     print("Optimal solution: ")
+                #     for i in range(numvar):
+                #         print("x[" + str(i) + "]=" + str(xx[i]))
+                print(f'limit force is {xx[-1]}')
+
+            else:
+                print("Other solution status")
+
+            result["limit_force"] = xx[-1]
+            result["contact_forces"] = xx[0:numvar-1]
+            result["xc"] = xc
+            result['suc'] = suc
+            # normalize the displacement
+            sum = 0
+            element_index = 0
+            for k, value in elems.items():
+                sum += value.ll[0]*y[element_index*6]+value.ll[1] * \
+                    y[element_index*6+1]+value.ll[2]*y[element_index*6+2]\
+                    + value.ll[3]*y[element_index*6+3]+value.ll[4]*y[element_index*6+4]\
+                    + value.ll[5]*y[element_index*6+5]
+                element_index += 1
+            if sum == 0:
+                result["displacements"] = y[0:len(elems)*6]
+            else:
+                result["displacements"] = (
+                    np.array(y[0:len(elems)*6])/sum).tolist()
+                
+            if result['limit_force'] > 0:
+                _update_elem_disp_3d(contps, elems, result["displacements"])
+    return result

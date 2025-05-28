@@ -1,0 +1,17 @@
+pandas
+threadpoolctl
+scikit-learn
+scikit-image
+shapely
+open3d
+meshio
+gmsh
+matplotlib
+opencv-python-headless
+tqdm
+fury
+pyevtk
+rtree
+mosek
+numba
+SciencePlots
