@@ -141,6 +141,8 @@ def plot_crack_map(df,df_element, save_file_name, wall_image_size,disp_factor = 
                 polycolor = 'black'
             else:
                 polycolor = 'grey'
+            if row_element['type'] == 'ground' or row_element['type'] == 'beam':
+                continue
             poly = Polygon(polygon_pts, closed=True, edgecolor='none', facecolor=polycolor)
             ax.add_patch(poly)
 

@@ -139,6 +139,8 @@ def plot_displaced(elems,contps, factor=1, save_fig=False, show_fig=True, filena
     lines = []
     d = 0
     for key, value in elems.items():
+        if value.type.startswith('ground') or value.type.startswith('beam'):
+            continue
         boundary_points = []
         center = value.center
         trans_x = value.displacement[0]*factor
@@ -459,8 +461,8 @@ def solve_pushover(elems, contps, node_control, unit_horizontal_load, max_iterat
             if e.type == 'beam':
                 displacement_x_beam+=e.displacement[0]
         _update_contp_force_2d(contps, solution['contact_forces'])
-        # to_csv_2d(
-        #         elems, contps, f'/pushover_step{i}_associative', result_folder)
+        to_csv_2d(
+                elems, contps, f'/pushover_step{i}_associative', result_folder)
         _displace_model_2d(elems, contps)
         positions.append(contps[node_control].coor[0])
 
@@ -720,7 +722,6 @@ def run_Vas_one_test(input):
     with open(str(_result_directory)+f'/load_multiplier.txt', 'a') as f:
         f.write(imagename+';'+solver +
                 f';{sampleid};{mm_fc};{mm_ft};{mm_c};{mm_mu};{mc_fc};{mc_ft};{mc_c};{mc_mu};{force_capacity_MPa}\n')
-
 # get model
 set_dimension(2)
 model = Model()

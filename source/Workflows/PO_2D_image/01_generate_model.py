@@ -196,7 +196,10 @@ def clockwise_sort(points):
 
     return clockwise_points
 
-
+def sort_by_x(points):
+    # Sort the points by their x-coordinate
+    sorted_points = points[np.argsort(points[:, 0])]
+    return sorted_points
 
 def create_elem_contp_from_vertices(elems, contps, idx_contps_reverse, contp_index, face_id, element_id, center, mass, vertices, type, _conttype):
     # It's important to shift the coordinate of vertices so that no confusion in contact pair detection in case of multiple elements sqreezing on one point
@@ -278,7 +281,6 @@ def pixel_to_elem_polystone(matrix, scale=1, density=1, contact_type_dict={"type
     if plot_edge_detection:
         tab20 = plt.get_cmap('tab20', 20)
         fig, axs = plt.subplots(1, 2)
-
     max_deviation = 0
     max_deviation_position = []
     min_x = np.inf
@@ -368,9 +370,9 @@ def pixel_to_elem_polystone(matrix, scale=1, density=1, contact_type_dict={"type
                         # add the first point
                         vertices_down = np.vstack(
                             (vertices[0, 0:2], vertices_down))
-                    if vertices[0, 0] > 0:
-                        vertices_down = np.vstack(
-                            (np.asarray[0, vertices[0, 1]], vertices_down))
+                    # if vertices[0, 0] > 0:
+                    #     vertices_down = np.vstack(
+                    #         (np.asarray[0, vertices[0, 1]], vertices_down))
                     if vertices[-1, 0:2].tolist() != vertices_down[-1].tolist():
                         # add the last point
                         vertices_down = np.vstack(
@@ -381,7 +383,8 @@ def pixel_to_elem_polystone(matrix, scale=1, density=1, contact_type_dict={"type
                     vertices_down = vertices_down[np.argsort(
                         np.linalg.norm(vertices_down, axis=1))]
                     # order the vertices
-                    vertices_down = clockwise_sort(vertices_down)
+                    #vertices_down = clockwise_sort(vertices_down)
+                    vertices_down = sort_by_x(vertices_down)
                 else:  # add the corner points
                     # add corner points
                     corner_coors = corner_peaks(
@@ -697,7 +700,10 @@ def pixel_to_elem_polystone(matrix, scale=1, density=1, contact_type_dict={"type
             vertices_max = np.max(vertices, axis=0)
         if plot_edge_detection:
             # add the first point to the end to close the polygon
-            plot_vertices = np.vstack((vertices, vertices[0]))
+            if _type == "beam" or _type == "ground":
+                plot_vertices = vertices
+            else:
+                plot_vertices = np.vstack((vertices, vertices[0]))
             axs[1].plot(plot_vertices[:, 0], plot_vertices[:, 1], 'o-',
                         linewidth=0.2, markersize=0.1, color=color)
 
@@ -748,8 +754,9 @@ def pixel_to_elem_polystone(matrix, scale=1, density=1, contact_type_dict={"type
             #ax.set_ylim(-0.5, matrix.shape[0]-0.5)
 
         # add text on top of the figure
-        axs[0].text(1, 1.1, 'Deviation: {:.2f} mm, Position {:.2f}, {:.2f}'.format(max_deviation, max_deviation_position[0], max_deviation_position[1]), fontsize=8,
-                    horizontalalignment='center', transform=axs[0].transAxes)
+        if len(max_deviation_position) > 0:
+            axs[0].text(1, 1.1, 'Deviation: {:.2f} mm, Position {:.2f}, {:.2f}'.format(max_deviation, max_deviation_position[0], max_deviation_position[1]), fontsize=8,
+                        horizontalalignment='center', transform=axs[0].transAxes)
         # remove axis
         axs[0].axis('off')
         axs[1].axis('off')
