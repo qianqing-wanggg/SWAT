@@ -1,0 +1,6 @@
+scale: 1
+Number of elements: 1382
+Number of contact points: 8476
+Stone/mortar ratio in original image0.07317073170731703
+Stone/mortar ratio in scaled image0.926829268292683
+Deviation in kmodel0

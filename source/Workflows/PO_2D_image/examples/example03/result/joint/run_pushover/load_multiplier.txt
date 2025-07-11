@@ -1,0 +1,2 @@
+image;solver;sampleid;mm_fc;mm_ft;mm_c;mm_mu;mc_fc;mc_ft;mc_c;mc_mu;force_capacity_MPa
+joint.png;associative;0;100;0.27;0.27;0.94;100;0.27;0.27;0.94;0.0
