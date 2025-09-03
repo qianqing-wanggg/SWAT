@@ -20,7 +20,7 @@
     "unit_density": 2600,
     "mortar_density": 1800,
     
-    "crack_gap":1000,
+    "crack_gap":0.0005,
     "E_stone":310e5,
     "E_mortar":310e3,
     "Poisson_stone":0.2,
@@ -31,7 +31,7 @@
     "hload_direction":1,
     "force_step":1,
     "disp_step":0.0001,
-    "max_iterations_pushover":50,
+    "max_iterations_pushover":10,
     "element_id_control":false,
     
     "plot_max_disp": 0.01,

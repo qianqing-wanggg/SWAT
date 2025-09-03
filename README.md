@@ -149,7 +149,7 @@ The input for an example analysis is in `Workflows/PO_2D_image/data`
 
 **Pushover-Specific Material Parameters:**
 
-- `crack_gap`: Gap threshold (mm) to zero tensile strength and cohesion
+- `crack_gap`: Gap threshold (m) to zero tensile strength and cohesion
 - `E_stone`, `E_mortar`: Young's modulus for stone and mortar
 - `Poisson_stone`, `Poisson_mortar`: Poisson's ratio for stone and mortar
 
